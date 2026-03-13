@@ -1,6 +1,6 @@
-# unsupervised_wav
+# wav2vec_unsupervised
 
-Unsupervised_wav is a collection of scripts that automate running the Fairseq wav2vec 2.0 Unsupervised Speech Recognition pipeline as described in the official Fairseq project:
+Wav2vec_unsupervised is a collection of scripts that automate running the Fairseq wav2vec 2.0 Unsupervised Speech Recognition pipeline as described in the official Fairseq project:
 
 https://github.com/facebookresearch/fairseq/blob/main/examples/wav2vec/unsupervised/README.md
 
