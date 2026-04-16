@@ -1,83 +1,128 @@
 #!/bin/bash
 
-# Source the implementation file to load all functions
+# =============================================================================
+# run_setup.sh — Orchestrate the full environment setup
+# =============================================================================
+#
+# CHANGES FROM ORIGINAL (see CHANGES.md for full rationale):
+#   1. lspci GPU detection replaced with a portable macOS/Linux check.
+#      On macOS: system_profiler detects Apple Silicon or discrete GPU.
+#      On Linux: lspci still used for NVIDIA detection.
+#   2. CUDA and GPU driver installation skipped on macOS (not supported).
+#   3. install_wav2vec_u() called after install_fairseq() so wav2vec_u.py
+#      is placed into the fairseq_ tree at the correct path.
+#   4. All output tee'd to a timestamped log file in $INSTALL_ROOT/logs/.
+#
+# USAGE
+#   chmod +x run_setup.sh && ./run_setup.sh
+#
+# =============================================================================
+
+# ── Load all functions ────────────────────────────────────────────────────────
 source "$(dirname "$0")/setup_functions.sh"
 
+# ── Prepare log directory and start logging ───────────────────────────────────
+create_dirs
+LOG_FILE="$INSTALL_ROOT/logs/setup_$(date +%Y%m%d_%H%M%S).log"
+# Redirect all output (stdout + stderr) to both the terminal and the log file
+exec > >(tee -a "$LOG_FILE") 2>&1
 
-# Calling functions defined in setup_functions.sh
-log "Starting custom setup sequence..."
+log "====================================================="
+log " wav2vec-U  Setup  —  $(date)"
+log " Platform  : $(uname -srm)"
+log " Log file  : $LOG_FILE"
+log " INSTALL_ROOT: $INSTALL_ROOT"
+log "====================================================="
 
-# ===============================================
-# 1. SETUP AND PREREQUISITES
-# ===============================================
+# =============================================================================
+# 1. SYSTEM PREREQUISITES
+# =============================================================================
 
 basic_dependencies
-# Install essential system packages and libraries required for compilation 
+# Installs build tools, cmake, wget, curl, boost, eigen, ffmpeg etc.
+# On macOS: uses Homebrew.  On Linux: uses apt-get.
 
-#the if statements, checks for the presence of a gpu.
-if lspci | grep -iq "nvidia"; then
-    echo "NVIDIA GPU detected. Proceeding with GPU setup..."
+# ── GPU detection (portable macOS / Linux) ────────────────────────────────────
+HAS_NVIDIA_GPU=false
 
-    cuda_installation
-    # Install the NVIDIA CUDA Toolkit. This provides the compiler (nvcc) and 
-    # libraries needed for GPU acceleration of deep learning frameworks.
-    
-    # nvidia_drivers_installation
-    gpu_drivers_installation
-    # Install or update the proprietary NVIDIA GPU drivers to ensure hardware 
-    # is correctly recognized and accessible by CUDA.
+if [[ "$(uname)" == "Darwin" ]]; then
+    # On macOS, NVIDIA CUDA is not supported (Apple dropped NVIDIA drivers in 2018).
+    # Apple Silicon Macs have the Neural Engine / MPS for GPU acceleration.
+    # We still check so we can log the GPU clearly.
+    if system_profiler SPDisplaysDataType 2>/dev/null | grep -qi "NVIDIA"; then
+        log "[INFO] NVIDIA GPU detected on macOS — CUDA is NOT supported on macOS."
+        log "       The model will use MPS (Apple Silicon) or CPU instead."
+    else
+        log "[INFO] macOS — using MPS (Apple Silicon GPU) or CPU. CUDA not applicable."
+    fi
+    # No CUDA install, no GPU driver install on macOS
 else
-    echo "No NVIDIA GPU found. Using CPU-only mode."
+    # Linux: check for NVIDIA GPU via lspci
+    if command -v lspci &>/dev/null && lspci | grep -iq "nvidia"; then
+        HAS_NVIDIA_GPU=true
+        log "NVIDIA GPU detected on Linux. Proceeding with GPU setup..."
+        cuda_installation
+        gpu_drivers_installation
+    else
+        log "No NVIDIA GPU found on Linux. Using CPU-only mode."
+    fi
 fi
 
-create_dirs
-# Create necessary directory structures for storing data, checkpoints, and final output 
-
-# ===============================================
+# =============================================================================
 # 2. PYTHON ENVIRONMENT AND CORE FRAMEWORKS
-# ===============================================
+# =============================================================================
 
 setup_venv
-# Create and activate a isolated Python virtual environment 
-# to manage project-specific dependencies without 
-# conflicting with the system Python installation.
+# Creates an isolated Python 3.10 virtual environment using pyenv.
 
 install_pytorch_and_other_packages
-# Install the PyTorch deep learning framework, which is the foundational 
-# tensor library used for training and running models. This often 
-# requires selecting a version compatible with the installed CUDA version.
-#also install other packapges need for a smooth execution of unsupervised wav2vec U. 
+# macOS: installs PyTorch with default wheels (includes MPS support).
+# Linux: installs PyTorch with CUDA 12.1 wheels if GPU is present.
 
 install_fairseq
-# Install the Fairseq sequence modeling toolkit (developed by Facebook AI). 
-# This library is typically used to implement and train state-of-the-art 
-# models like Wav2Vec 2.0 and Transformer networks.
+# Clones the Ashesi fork of fairseq and installs it in editable mode.
 
-install_flashlight #installs flashlight-text and flashlight-sequence
-# This is often used for fast decoding in speech recognition models.
+install_wav2vec_u
+# Copies wav2vec_u.py (the custom GAN model with Generator / RealData /
+# Discriminator separation of concerns) into:
+#   fairseq_/examples/wav2vec/unsupervised/models/wav2vec_u.py
 
-# ===============================================
+# =============================================================================
 # 3. DOMAIN-SPECIFIC TOOLS
-# ===============================================
+# =============================================================================
+
+install_flashlight
+# Installs flashlight-text and builds the flashlight-sequence C++ library.
+# Required for fast beam-search decoding during evaluation.
 
 install_kenlm
-# Install the KenLM language modeling toolkit. This is crucial for 
-# integrating a language model during the decoding phase of speech 
-# recognition to improve transcription accuracy.
+# Builds KenLM from source (C++).  Used in prepare_text to train a
+# character/phoneme n-gram language model on the unlabelled text corpus.
 
 install_rVADfast
-# Install a fast implementation of Robust Voice Activity Detection (rVAD). 
-# This tool is used to identify and segment speech portions within 
-# audio files, filtering out silence and noise.
-# ===============================================
-# 4. DATA AND MODEL ARTIFACTS
-# ===============================================
+# Clones rVADfast for voice activity detection (silence removal) from audio.
+
+# =============================================================================
+# 4. MODEL CHECKPOINTS
+# =============================================================================
 
 download_pretrained_model
-# Download the wav2vec_vox_new.pt pre-trained deep learning model checkpoint
+# Downloads wav2vec_vox_new.pt — the pre-trained wav2vec 2.0 feature extractor.
 
 download_languageIdentification_model
-# Download the lid.176.bin pre-trained model specifically designed for determining the 
-# language spoken in an audio file.
+# Downloads lid.176.bin — FastText language identification model used by
+# prepare_text.sh to filter out non-English text lines.
 
-log "Custom setup sequence completed!"
+# =============================================================================
+log "====================================================="
+log " Setup complete!  $(date)"
+log " Log saved to: $LOG_FILE"
+log ""
+log " Next steps:"
+log "   1. Edit config.sh to set DEVICE and TEST_RUN as desired."
+log "   2. Run: ./run_wav2vec.sh"
+log "      (Converts audio, creates manifests, prepares features)"
+log "   3. Run: ./run_gans.sh"
+log "      (Trains the GAN)"
+log "   4. Run: ./run_eval.sh /path/to/checkpoint.pt"
+log "====================================================="

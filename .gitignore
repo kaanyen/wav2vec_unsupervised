@@ -1,0 +1,42 @@
+# Large / local data (never commit)
+data/
+
+# Python environments
+venv/
+.venv/
+env/
+
+# Training outputs and Hydra runs
+outputs/
+multirun/
+
+# Logs
+logs/
+*.log
+
+# Downloaded models / optional assets
+pre-trained/
+lid_model/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# KenLM / native builds (rebuild via setup)
+kenlm/build/
+
+# flashlight-sequence and similar (often built locally)
+sequence/build/
+
+# Jupyter
+.ipynb_checkpoints/

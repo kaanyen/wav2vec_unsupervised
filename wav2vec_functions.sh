@@ -1,90 +1,137 @@
 #!/bin/bash
 
-# Wav2Vec Unsupervised Pipeline Runner
-# This script runs the entire fairseq wav2vec unsupervised pipeline
-# with checkpointing to allow resuming from any step
+# =============================================================================
+# wav2vec_functions.sh — Data-preparation pipeline functions
+# =============================================================================
+#
+# CHANGES FROM ORIGINAL (see CHANGES.md for full rationale):
+#   1. sed -i fixed for macOS.  BSD sed requires: sed -i '' 's/.../.../'.
+#      GNU sed (Linux) accepts sed -i without a backup extension.
+#      A portable wrapper (portable_sed_i) is used throughout.
+#   2. TEST_RUN data limiting added to manifest creation functions.
+#      When TEST_RUN=true (set in config.sh) only TEST_AUDIO_LIMIT audio
+#      files per split are kept in each manifest, enabling a fast smoke-test
+#      of the whole pipeline without processing the full 28 k-file dataset.
+#   3. prepare_text uses TEST_TEXT_LIMIT to cap the text corpus size.
+#   4. When TEST_RUN=false, AUDIO_DATA_PERCENT / TEXT_DATA_PERCENT optionally
+#      subsample manifests and text (e.g. 20% full pipeline run).
+#
+# =============================================================================
 
-set -e  # Exit on error
-set -o pipefail  # Exit if any command in a pipe fails
+set -e
+set -o pipefail
 
-TRAIN_DATASETS=$1 #/path/to/unlabelled/train_audio_data 
-VAL_DATASETS=$2 #/path/to/unlabelled/validation_audio_data 
-TEST_DATASETS=$3
-UNLABELLED_TEXT=$4 #/path/to/unlabelled_text_file 
+# ── Accept dataset paths as positional arguments ──────────────────────────────
+TRAIN_DATASETS=$1   # path to training WAV directory
+VAL_DATASETS=$2     # path to validation WAV directory
+TEST_DATASETS=$3    # path to test WAV directory
+UNLABELLED_TEXT=$4  # path to unlabelled text file (one sentence per line)
 
-source utils.sh
+source "$(dirname "${BASH_SOURCE[0]}")/utils.sh"
 
 
 # ==================== HELPER FUNCTIONS ====================
 
-
-# updating code in SPEECHPROCS to return outputs that are compatible with code change in vads.py
-fixing_sflux() {
-    TARGET_FILE="$SPEECHPROCS"
-
-    # Check if the file exists
-    if [ -f "$TARGET_FILE" ]; then
-        echo "Updating sflux() to return two values in $TARGET_FILE..."
-        
-        # Find and modify the return statement inside sflux()
-        sed -i '/def sflux/,/return/ s/^ *return .*/    return s_flatness, n_frames/' "$TARGET_FILE"
-        
-        # Confirm the fix by printing the modified return statement
-        echo "Updated return statement in sflux():"
-        grep "return " "$TARGET_FILE"
-        
-        echo "Fix applied successfully!"
+# Portable in-place sed: macOS (BSD) sed requires sed -i '' '...'
+# GNU sed (Linux) accepts sed -i '...'
+portable_sed_i() {
+    # $1 = expression   $2 = file
+    if sed --version 2>&1 | grep -q GNU; then
+        sed -i "$1" "$2"
     else
-        echo "Error: $TARGET_FILE not found!"
+        sed -i '' "$1" "$2"
+    fi
+}
+
+
+# Fix rVADfast's sflux() to return both spectral flatness and n_frames.
+# The original sflux() only returned s_flatness; the modified vads.py
+# expects both values.  This sed patch is applied once during pipeline init.
+fixing_sflux() {
+    local TARGET_FILE="$SPEECHPROCS"
+    if [ -f "$TARGET_FILE" ]; then
+        log "Patching sflux() return value in $TARGET_FILE ..."
+        portable_sed_i '/def sflux/,/return/ s/^ *return .*/    return s_flatness, n_frames/' "$TARGET_FILE"
+        log "sflux() patched successfully."
+    else
+        log "[ERROR] $TARGET_FILE not found — cannot patch sflux()"
         exit 1
     fi
 }
 
 
-#update is done in add-self-loop-simple.cc to replace std::endl with "\n" since std::endl is not compatible with pykaldi installation for text preprocessing
+# Patch add-self-loop-simple.cc: replace std::endl with "\n" to avoid
+# a compatibility issue with pykaldi's stream handling.
 replace_std_endl() {
     local input_file="$1"
-    
     if [[ ! -f "$input_file" ]]; then
-        echo "Error: File '$input_file' not found!"
+        log "[ERROR] File not found: $input_file"
         return 1
     fi
-
-    # Use sed to replace std::endl with \n and save the output
-    sed -i 's/std::endl/"\\n"/g' "$input_file"
-
-    echo "Replacement done in '$input_file'"
+    portable_sed_i 's/std::endl/"\\n"/g' "$input_file"
+    log "Replaced std::endl with \"\\n\" in $input_file"
 }
 
 
-# Update sample_pct in the file 'prepare_audio'-- the variable measures the amount of audio dataset
-#to us in generating k-mean clusters 
-update_sample_pct(){
-# This regex matches '--sample-pct' followed by any whitespace and a number (integer or decimal)
-# and replaces it with '--sample-pct' followed by the new value.
-    sed -i.bak -E "s/(--sample-pct[[:space:]]+)[0-9]*\.?[0-9]+/\1${NEW_SAMPLE_PCT}/g" $PREPARE_AUDIO
-    echo "Updated '--sample-pct' to ${NEW_SAMPLE_PCT} in 'prepare_audio'. Backup saved as 'prepare_audio.bak'."
-
-}
-
-# Update batch_size in the file 'prepare_audio'
-update_batch_size()
-{
-    sed -i.bak -E "s/(--batch-size[[:space:]]+)[0-9]+/\1${NEW_BATCH_SIZE}/g" $PREPARE_AUDIO
-    echo "Updated '--batch-size' to ${NEW_BATCH_SIZE} in 'prepare_audio'. Backup saved as 'prepare_audio.bak'."
-
+# Update --sample-pct in prepare_audio.sh (fraction of audio used for k-means).
+update_sample_pct() {
+    sed -i.bak -E \
+        "s/(--sample-pct[[:space:]]+)[0-9]*\.?[0-9]+/\1${NEW_SAMPLE_PCT}/g" \
+        "$PREPARE_AUDIO"
+    log "Updated --sample-pct to ${NEW_SAMPLE_PCT} in prepare_audio.sh"
 }
 
 
+# Update --batch-size in prepare_audio.sh.
+update_batch_size() {
+    sed -i.bak -E \
+        "s/(--batch-size[[:space:]]+)[0-9]+/\1${NEW_BATCH_SIZE}/g" \
+        "$PREPARE_AUDIO"
+    log "Updated --batch-size to ${NEW_BATCH_SIZE} in prepare_audio.sh"
+}
 
-# ==================== MAIN STEPS ====================
 
-# Step 1: Create data manifests
-# Step 1: Create data manifests - Modified Functions
+# =============================================================================
+# Helper: optionally truncate a manifest (TSV) for TEST_RUN only.
+# Subsampling by AUDIO_DATA_PERCENT is done once in convert_audio.sh (FLAC list);
+# manifests always list every WAV under data/wav — no second %-cut on TSVs.
+# Manifests have a header line (the root path), so data rows are lines 2+.
+# =============================================================================
+maybe_truncate_manifest() {
+    local manifest_file="$1"   # e.g. $MANIFEST_DIR/train.tsv
+    local label="$2"           # human-readable name for logging
 
+    local total_lines
+    total_lines=$(wc -l < "$manifest_file")
+    # Manifest line 1 is the header (root dir path), so data lines = total-1
+    local data_lines=$(( total_lines - 1 ))
+    if [ "$data_lines" -le 0 ]; then
+        return 0
+    fi
+
+    if [ "$TEST_RUN" != true ]; then
+        return 0
+    fi
+
+    local keep="$TEST_AUDIO_LIMIT"
+    if [ "$data_lines" -le "$keep" ]; then
+        log "[$label] TEST_RUN=true — manifest has $data_lines ≤ $keep entries — no truncation."
+        return 0
+    fi
+    log "[$label] TEST_RUN=true — truncating manifest from $data_lines to $keep entries"
+
+    local tmp_file="${manifest_file}.tmp"
+    head -n $(( keep + 1 )) "$manifest_file" > "$tmp_file"
+    mv "$tmp_file" "$manifest_file"
+    log "[$label] Manifest truncated."
+}
+
+
+# ==================== MAIN PIPELINE STEPS ====================
+
+# Step 1a: Create train manifest (train.tsv)
 create_manifests_train() {
-
-    local step_name="create_manifests_train" 
+    local step_name="create_manifests_train"
 
     if is_completed "$step_name"; then
         log "Skipping train manifest creation (already completed)"
@@ -94,29 +141,25 @@ create_manifests_train() {
     log "Creating TRAIN data manifest..."
     mark_in_progress "$step_name"
 
-    # Ensure the validation file potentially created here is removed or ignored later
-    # Run the script to create train.tsv (and an empty valid.tsv)
     python "$FAIRSEQ_ROOT/examples/wav2vec/wav2vec_manifest.py" \
         "$TRAIN_DATASETS" \
         --dest "$MANIFEST_DIR" \
         --ext wav \
-        --valid-percent 0 # Force 100% to train.tsv
+        --valid-percent 0
 
-    # Check if the command was successful
     if [ $? -eq 0 ]; then
-        # Optional: remove the empty valid.tsv if you want clarity
-        # rm -f "$MANIFEST_DIR/valid.tsv"
+        maybe_truncate_manifest "$MANIFEST_DIR/train.tsv" "train"
         mark_completed "$step_name"
         log "TRAIN manifest creation completed successfully"
     else
-        log "ERROR: TRAIN manifest creation failed"
+        log "[ERROR] TRAIN manifest creation failed"
         exit 1
     fi
 }
 
+# Step 1b: Create validation manifest (valid.tsv)
 create_manifests_val() {
-
-    local step_name="create_manifests_val" 
+    local step_name="create_manifests_val"
 
     if is_completed "$step_name"; then
         log "Skipping validation manifest creation (already completed)"
@@ -126,200 +169,30 @@ create_manifests_val() {
     log "Creating VALIDATION data manifest..."
     mark_in_progress "$step_name"
 
-    # Create a temporary directory for the validation manifest generation
     local TEMP_VAL_DIR
     TEMP_VAL_DIR=$(mktemp -d "$MANIFEST_DIR/val_manifest.XXXXXX")
-    log "Using temporary directory for validation manifest: $TEMP_VAL_DIR"
 
-    # Generate manifests in the temporary directory (will create empty train.tsv and desired valid.tsv)
     python "$FAIRSEQ_ROOT/examples/wav2vec/wav2vec_manifest.py" \
         "$VAL_DATASETS" \
         --dest "$TEMP_VAL_DIR" \
         --ext wav \
-        --valid-percent 1.0 # Force 100% to valid.tsv
+        --valid-percent 1.0
 
     local python_exit_code=$?
 
     if [ $python_exit_code -eq 0 ]; then
-        # Move the generated valid.tsv to the main manifest directory, overwriting the empty one if it exists
         if [ -f "$TEMP_VAL_DIR/valid.tsv" ]; then
             mv "$TEMP_VAL_DIR/valid.tsv" "$MANIFEST_DIR/valid.tsv"
-            log "Moved validation manifest to $MANIFEST_DIR/valid.tsv"
+            maybe_truncate_manifest "$MANIFEST_DIR/valid.tsv" "val"
             mark_completed "$step_name"
             log "VALIDATION manifest creation completed successfully"
         else
-             log "ERROR: Expected valid.tsv not found in temporary directory $TEMP_VAL_DIR"
-             rm -rf "$TEMP_VAL_DIR" # Clean up temp dir
-             exit 1
-        fi
-    else
-        log "ERROR: VALIDATION manifest creation failed (Python script error)"
-        # No need to mark completed
-    fi
-
-    # Clean up the temporary directory
-    rm -rf "$TEMP_VAL_DIR"
-    log "Cleaned up temporary directory $TEMP_VAL_DIR"
-}
-
-create_manifests_test() {
-
-    local step_name="create_manifests_test" 
-
-    if is_completed "$step_name"; then
-        log "Skipping train manifest creation (already completed)"
-        return 0
-    fi
-    
-    log "Creating Test data manifest..."
-    mark_in_progress "$step_name"
-    MANIFEST_TEST_DIR=$DATA_ROOT/manifest_test
-    
-    mkdir -p $MANIFEST_TEST_DIR
-
-    # Ensure the validation file potentially created here is removed or ignored later
-    # Run the script to create train.tsv (and an empty valid.tsv)
-    python "$FAIRSEQ_ROOT/examples/wav2vec/wav2vec_manifest.py" \
-        "$TEST_DATASETS" \
-        --dest "$MANIFEST_TEST_DIR" \
-        --ext wav \
-        --valid-percent 0 # Force 100% to train.tsv
-
-    # Check if the command was successful
-    cp -r $MANIFEST_TEST_DIR/train.tsv $MANIFEST_NONSIL_DIR/test.tsv
-    rm -rf $MANIFEST_TEST_DIR
-    if [ $? -eq 0 ]; then
-        # Optional: remove the empty valid.tsv if you want clarity
-        # rm -f "$MANIFEST_DIR/valid.tsv"
-        mark_completed "$step_name"
-        log "TEST manifest creation completed successfully"
-    else
-        log "ERROR: TEST manifest creation failed"
-        exit 1
-    fi
-}
-
-# --- In your main function ---
-# Step 2: create vads files out of the audios 
-create_rVADfast() { 
-    
-    local step_name="create_rVADfast"
-    # # fixing certain code errors in the rvads  
-    fixing_sflux #this script changes the sflux function to return both ft and n_frames
-
-    if is_completed "$step_name"; then
-        log "Skipping audio silence removal (already completed)"
-        return 0
-    fi
-    
-    
-    log "removing silence from audios"
-    mark_in_progress "$step_name"
-    python "$DIR_PATH/vads.py" -r $RVAD_ROOT < "$MANIFEST_DIR/train.tsv" > "$MANIFEST_DIR/train.vads"
-    python "$DIR_PATH/vads.py" -r $RVAD_ROOT < "$MANIFEST_DIR/valid.tsv" > "$MANIFEST_DIR/valid.vads"
-    # Check if the command was successful
-    if [ $? -eq 0 ]; then
-        mark_completed "$step_name"
-        log "silence removed successfully"
-    else
-        log "ERROR: silence removal  failed"
-        exit 1
-    fi
-}
-
-# Step 3: Remove silence from audios with vads files 
-remove_silence() {
-
-    local step_name="remove_silence"
-
-   if is_completed "$step_name"; then
-        log "Skipping audio silence removal1 (already completed)"
-        return 0
-    fi
-    
-    
-    log "removing silence from audios1"
-    mark_in_progress "$step_name"
-
-    python "$FAIRSEQ_ROOT/examples/wav2vec/unsupervised/scripts/remove_silence.py" --tsv "$MANIFEST_DIR/train.tsv" --vads "$MANIFEST_DIR/train.vads" --out "$NONSIL_AUDIO/train"
-    python "$FAIRSEQ_ROOT/examples/wav2vec/unsupervised/scripts/remove_silence.py" --tsv "$MANIFEST_DIR/valid.tsv" --vads "$MANIFEST_DIR/valid.vads" --out "$NONSIL_AUDIO/val"
-    
-    # Check if the command was successful
-    if [ $? -eq 0 ]; then
-        mark_completed "$step_name"
-        log "silence1 removed successfully"
-    else
-        log "ERROR: silence removal  failed"
-        exit 1
-    fi
-
-}
-
-#Step 4: create new manifest files for train and validation set with no silence 
-create_manifests_nonsil_train() {
-    local step_name="create_manifests_nonsil_train"
-    if is_completed "$step_name"; then
-        log "Skipping nonsil manifest creation (already completed)"
-        return 0
-    fi
-    
-    log "Creating data manifests..."
-    mark_in_progress "$step_name"
-    
-    python "$FAIRSEQ_ROOT/examples/wav2vec/wav2vec_manifest.py" \
-        "$NONSIL_AUDIO/train" \
-        --dest "$MANIFEST_NONSIL_DIR" \
-        --ext wav \
-        --valid-percent 0 
-
-    # Check if the command was successful
-    if [ $? -eq 0 ]; then
-        mark_completed "$step_name"
-        log "nonsil Manifest creation completed successfully"
-    else
-        log "ERROR: nonsil Manifest creation failed"
-        exit 1
-    fi
-}
-
-create_manifests_nonsil_val() {
-    local step_name="create_manifests_nonsil_val"
-    
-    if is_completed "$step_name"; then
-        log "Skipping nonsil validation manifest creation (already completed)"
-        return 0
-    fi
-    
-    log "Creating nonsil validation manifests..."
-    mark_in_progress "$step_name"
-
-    local TEMP_VAL_DIR
-    TEMP_VAL_DIR=$(mktemp -d "$MANIFEST_NONSIL_DIR/val_manifest.XXXXXX")
-    log "Using temporary directory for validation manifest: $TEMP_VAL_DIR"
-
-    # Run the manifest creation and capture exit code immediately
-    python "$FAIRSEQ_ROOT/examples/wav2vec/wav2vec_manifest.py" \
-        "$NONSIL_AUDIO/val" \
-        --dest "$TEMP_VAL_DIR" \
-        --ext wav \
-        --valid-percent 1.0
-    local python_exit_code=$?
-
-    # Process results
-    if [ $python_exit_code -eq 0 ]; then
-        if [ -f "$TEMP_VAL_DIR/valid.tsv" ]; then
-            mkdir -p "$MANIFEST_NONSIL_DIR"
-            mv "$TEMP_VAL_DIR/valid.tsv" "$MANIFEST_NONSIL_DIR/valid.tsv"
-            log "Moved validation manifest to $MANIFEST_NONSIL_DIR/valid.tsv"
-            mark_completed "$step_name"
-            log "VALIDATION manifest creation completed successfully"
-        else
-            log "ERROR: Expected valid.tsv not found in temporary directory $TEMP_VAL_DIR"
+            log "[ERROR] Expected valid.tsv not found in $TEMP_VAL_DIR"
             rm -rf "$TEMP_VAL_DIR"
             exit 1
         fi
     else
-        log "ERROR: VALIDATION manifest creation failed (Python exit code: $python_exit_code)"
+        log "[ERROR] VALIDATION manifest creation failed (Python script error)"
         rm -rf "$TEMP_VAL_DIR"
         exit 1
     fi
@@ -327,69 +200,267 @@ create_manifests_nonsil_val() {
     rm -rf "$TEMP_VAL_DIR"
 }
 
-#Step 5: Prepare audio file
-prepare_audio() {
+# Step 1c: Create test manifest (placed into MANIFEST_NONSIL_DIR/test.tsv)
+create_manifests_test() {
+    local step_name="create_manifests_test"
 
-   local step_name="prepare_audio"
-   export FAIRSEQ_ROOT=$FAIRSEQ_ROOT
-   # export KALDI_ROOT=$KALDI_ROOT
-   # export KALDI_ROOT="$DIR_PATH/pykaldi/tools/kaldi"
-   export KENLM_ROOT="$KENLM_ROOT"
-
-   update_sample_pct #personal scripts added to change sample_pct variable in prepare_audio.sh
-   update_batch_size #personal scripts added to change batch_size variable in prepare_audio.sh  
-
-
-   export KENLM_ROOT="$KENLM_ROOT"
-
-
-   if is_completed "$step_name"; then
-        log "Skipping audio preparation (already completed)"
+    if is_completed "$step_name"; then
+        log "Skipping test manifest creation (already completed)"
         return 0
     fi
-    
-    log "audio preparation"
+
+    log "Creating TEST data manifest..."
     mark_in_progress "$step_name"
 
-    zsh "$FAIRSEQ_ROOT/examples/wav2vec/unsupervised/scripts/prepare_audio.sh" "$MANIFEST_NONSIL_DIR" $CLUSTERING_DIR $MODEL 512 14
+    local MANIFEST_TEST_DIR="$DATA_ROOT/manifest_test"
+    mkdir -p "$MANIFEST_TEST_DIR"
 
+    python "$FAIRSEQ_ROOT/examples/wav2vec/wav2vec_manifest.py" \
+        "$TEST_DATASETS" \
+        --dest "$MANIFEST_TEST_DIR" \
+        --ext wav \
+        --valid-percent 0
 
-    # Check if the command was successful
+    maybe_truncate_manifest "$MANIFEST_TEST_DIR/train.tsv" "test"
+    cp "$MANIFEST_TEST_DIR/train.tsv" "$MANIFEST_NONSIL_DIR/test.tsv"
+    rm -rf "$MANIFEST_TEST_DIR"
+
     if [ $? -eq 0 ]; then
         mark_completed "$step_name"
-        log "audio preparation successfully"
+        log "TEST manifest creation completed successfully"
     else
-        log "ERROR: audio preparation  failed"
+        log "[ERROR] TEST manifest creation failed"
+        exit 1
+    fi
+}
+
+
+# Step 2: Run rVADfast to identify silence regions in each audio file.
+create_rVADfast() {
+    local step_name="create_rVADfast"
+
+    fixing_sflux   # patch speechproc.py before running vads.py
+
+    if is_completed "$step_name"; then
+        log "Skipping rVADfast (already completed)"
+        return 0
+    fi
+
+    log "Running rVADfast to detect silence ..."
+    mark_in_progress "$step_name"
+
+    python "$DIR_PATH/vads.py" -r "$RVAD_ROOT" < "$MANIFEST_DIR/train.tsv" > "$MANIFEST_DIR/train.vads"
+    python "$DIR_PATH/vads.py" -r "$RVAD_ROOT" < "$MANIFEST_DIR/valid.tsv" > "$MANIFEST_DIR/valid.vads"
+
+    if [ $? -eq 0 ]; then
+        mark_completed "$step_name"
+        log "rVADfast completed successfully"
+    else
+        log "[ERROR] rVADfast failed"
+        exit 1
+    fi
+}
+
+
+# Step 3: Remove silence segments from audio using the .vads files.
+remove_silence() {
+    local step_name="remove_silence"
+
+    if is_completed "$step_name"; then
+        log "Skipping silence removal (already completed)"
+        return 0
+    fi
+
+    log "Removing silence from audio ..."
+    mark_in_progress "$step_name"
+
+    python "$FAIRSEQ_ROOT/examples/wav2vec/unsupervised/scripts/remove_silence.py" \
+        --tsv "$MANIFEST_DIR/train.tsv" \
+        --vads "$MANIFEST_DIR/train.vads" \
+        --out "$NONSIL_AUDIO/train"
+
+    python "$FAIRSEQ_ROOT/examples/wav2vec/unsupervised/scripts/remove_silence.py" \
+        --tsv "$MANIFEST_DIR/valid.tsv" \
+        --vads "$MANIFEST_DIR/valid.vads" \
+        --out "$NONSIL_AUDIO/val"
+
+    if [ $? -eq 0 ]; then
+        mark_completed "$step_name"
+        log "Silence removal completed successfully"
+    else
+        log "[ERROR] Silence removal failed"
+        exit 1
+    fi
+}
+
+
+# Step 4a: Re-create train manifest on silence-free audio.
+create_manifests_nonsil_train() {
+    local step_name="create_manifests_nonsil_train"
+
+    if is_completed "$step_name"; then
+        log "Skipping nonsil train manifest (already completed)"
+        return 0
+    fi
+
+    log "Creating non-silence TRAIN manifest..."
+    mark_in_progress "$step_name"
+
+    python "$FAIRSEQ_ROOT/examples/wav2vec/wav2vec_manifest.py" \
+        "$NONSIL_AUDIO/train" \
+        --dest "$MANIFEST_NONSIL_DIR" \
+        --ext wav \
+        --valid-percent 0
+
+    if [ $? -eq 0 ]; then
+        maybe_truncate_manifest "$MANIFEST_NONSIL_DIR/train.tsv" "nonsil_train"
+        mark_completed "$step_name"
+        log "Nonsil TRAIN manifest completed successfully"
+    else
+        log "[ERROR] Nonsil TRAIN manifest failed"
+        exit 1
+    fi
+}
+
+# Step 4b: Re-create validation manifest on silence-free audio.
+create_manifests_nonsil_val() {
+    local step_name="create_manifests_nonsil_val"
+
+    if is_completed "$step_name"; then
+        log "Skipping nonsil val manifest (already completed)"
+        return 0
+    fi
+
+    log "Creating non-silence VALIDATION manifest..."
+    mark_in_progress "$step_name"
+
+    local TEMP_VAL_DIR
+    TEMP_VAL_DIR=$(mktemp -d "$MANIFEST_NONSIL_DIR/val_manifest.XXXXXX")
+
+    python "$FAIRSEQ_ROOT/examples/wav2vec/wav2vec_manifest.py" \
+        "$NONSIL_AUDIO/val" \
+        --dest "$TEMP_VAL_DIR" \
+        --ext wav \
+        --valid-percent 1.0
+    local python_exit_code=$?
+
+    if [ $python_exit_code -eq 0 ]; then
+        if [ -f "$TEMP_VAL_DIR/valid.tsv" ]; then
+            mkdir -p "$MANIFEST_NONSIL_DIR"
+            mv "$TEMP_VAL_DIR/valid.tsv" "$MANIFEST_NONSIL_DIR/valid.tsv"
+            maybe_truncate_manifest "$MANIFEST_NONSIL_DIR/valid.tsv" "nonsil_val"
+            mark_completed "$step_name"
+            log "Nonsil VALIDATION manifest completed successfully"
+        else
+            log "[ERROR] valid.tsv not found in $TEMP_VAL_DIR"
+            rm -rf "$TEMP_VAL_DIR"
+            exit 1
+        fi
+    else
+        log "[ERROR] Nonsil VALIDATION manifest failed (Python exit code: $python_exit_code)"
+        rm -rf "$TEMP_VAL_DIR"
         exit 1
     fi
 
+    rm -rf "$TEMP_VAL_DIR"
 }
 
-#======================Text preparation =================================
-# unsupervised/wav2vec-U/libri_dataset/librispeech-lm-norm_4k.txt
-prepare_text() {
-   local step_name="prepare_text"
-   export FAIRSEQ_ROOT=$FAIRSEQ_ROOT
-   # export KALDI_ROOT=$KALDI_ROOT
-   # export KALDI_ROOT="$DIR_PATH/pykaldi/tools/kaldi"
-   export KENLM_ROOT="$KENLM_ROOT"
 
-   if is_completed "$step_name"; then
+# Step 5: Prepare audio features (k-means clustering → pseudo-phonemes).
+prepare_audio() {
+    local step_name="prepare_audio"
+    export FAIRSEQ_ROOT="$FAIRSEQ_ROOT"
+    export KENLM_ROOT="$KENLM_ROOT"
+
+    update_sample_pct
+    update_batch_size
+
+    if is_completed "$step_name"; then
+        log "Skipping audio preparation (already completed)"
+        return 0
+    fi
+
+    log "Preparing audio features (k-means clustering) ..."
+    mark_in_progress "$step_name"
+
+    # Faiss/OpenMP on macOS: k-means can deadlock with multi-threaded BLAS/OpenMP
+    # (0% CPU).  Default to single-threaded here; raise FAISS_OMP_THREADS etc. if needed.
+    export KMP_DUPLICATE_LIB_OK=TRUE
+    if [ "$(uname -s)" = "Darwin" ]; then
+        export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+        export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+        export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+        export VECLIB_MAXIMUM_THREADS="${VECLIB_MAXIMUM_THREADS:-1}"
+        export FAISS_OMP_THREADS="${FAISS_OMP_THREADS:-1}"
+    else
+        export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
+        export MKL_NUM_THREADS="${MKL_NUM_THREADS:-4}"
+    fi
+
+    zsh "$FAIRSEQ_ROOT/examples/wav2vec/unsupervised/scripts/prepare_audio.sh" \
+        "$MANIFEST_NONSIL_DIR" "$CLUSTERING_DIR" "$MODEL" 512 14
+
+    if [ $? -eq 0 ]; then
+        mark_completed "$step_name"
+        log "Audio preparation completed successfully"
+    else
+        log "[ERROR] Audio preparation failed"
+        exit 1
+    fi
+}
+
+
+# Step 6: Prepare text data (phonemise, build n-gram LM).
+# When TEST_RUN=true, only TEST_TEXT_LIMIT lines. When TEST_RUN=false and
+# TEXT_DATA_PERCENT < 100, use that percentage of lines (deterministic head).
+prepare_text() {
+    local step_name="prepare_text"
+    export FAIRSEQ_ROOT="$FAIRSEQ_ROOT"
+    export KENLM_ROOT="$KENLM_ROOT"
+
+    if is_completed "$step_name"; then
         log "Skipping text preparation (already completed)"
         return 0
     fi
 
-    log "audio preparation."
+    log "Preparing text data ..."
     mark_in_progress "$step_name"
-    replace_std_endl $ADD_SELF_LOOP_SIMPLE  # this replaces the fixes error caused by the old script std::endl with \n
-    zsh "$FAIRSEQ_ROOT/examples/wav2vec/unsupervised/scripts/prepare_text.sh" $LANG $UNLABELLED_TEXT $TEXT_OUTPUT $MIN_PHONES $PHONEMIZER "$FASTTEXT_LIB_MODEL" 0.25 
-    # Check if the command was successful
-    if [ $? -eq 0 ]; then
-        mark_completed "$step_name"
-        log "text preparation successfully"
-    else
-        log "ERROR: text preparation  failed"
-        exit 1
+
+    # Determine which text file to pass to prepare_text.sh
+    local text_file="$UNLABELLED_TEXT"
+    if [ "$TEST_RUN" = true ]; then
+        local subset_file="$DATA_ROOT/text_subset_${TEST_TEXT_LIMIT}.txt"
+        if [ ! -f "$subset_file" ]; then
+            log "TEST_RUN=true — creating text subset of $TEST_TEXT_LIMIT lines at $subset_file"
+            head -n "$TEST_TEXT_LIMIT" "$UNLABELLED_TEXT" > "$subset_file"
+        else
+            log "TEST_RUN=true — reusing existing text subset $subset_file"
+        fi
+        text_file="$subset_file"
+    elif [ "${TEXT_DATA_PERCENT:-100}" -lt 100 ] 2>/dev/null \
+        && [ "${TEXT_DATA_PERCENT:-100}" -gt 0 ] 2>/dev/null; then
+        local tpct="${TEXT_DATA_PERCENT:-100}"
+        local subset_file="$DATA_ROOT/text_subset_pct${tpct}.txt"
+        local total_lines
+        total_lines=$(wc -l < "$UNLABELLED_TEXT")
+        local keep=$(( total_lines * tpct / 100 ))
+        if [ "$keep" -lt 1 ] && [ "$total_lines" -gt 0 ]; then keep=1; fi
+        log "TEXT_DATA_PERCENT=$tpct — creating text subset of $keep / $total_lines lines at $subset_file"
+        head -n "$keep" "$UNLABELLED_TEXT" > "$subset_file"
+        text_file="$subset_file"
     fi
 
+    replace_std_endl "$ADD_SELF_LOOP_SIMPLE"
+
+    zsh "$FAIRSEQ_ROOT/examples/wav2vec/unsupervised/scripts/prepare_text.sh" \
+        "$LANG" "$text_file" "$TEXT_OUTPUT" "$MIN_PHONES" "$PHONEMIZER" \
+        "$FASTTEXT_LIB_MODEL" 0.25
+
+    if [ $? -eq 0 ]; then
+        mark_completed "$step_name"
+        log "Text preparation completed successfully"
+    else
+        log "[ERROR] Text preparation failed"
+        exit 1
+    fi
 }

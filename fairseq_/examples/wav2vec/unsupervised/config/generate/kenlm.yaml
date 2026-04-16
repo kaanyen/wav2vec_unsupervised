@@ -1,0 +1,32 @@
+# @package _group_
+# Word LM + lexicon decoding (Flashlight LexiconDecoder). Use with:
+#   lexicon=/path/to/lexicon_filtered.lst
+#   lm_model=/path/to/kenlm.wrd.o40003.bin
+
+fairseq:
+  task:
+    _name: unpaired_audio_text
+    labels: phn
+    data: ???
+    sort_by_length: false
+    shuffle: false
+    text_data: ''
+
+  common_eval:
+    path: ???
+    quiet: true
+
+  dataset:
+    gen_subset: valid
+    batch_size: 1
+
+w2l_decoder: KENLM
+# Phone-unit LM (LexiconFreeDecoder): set unit_lm=true and pass lm_model=…/lm.phones.filtered.04.bin
+# Word+lexicon decode instead: unit_lm=false and pass lexicon=… + lm_model=…/kenlm.wrd.o40003.bin
+unit_lm: true
+post_process: silence
+beam: 10
+# Phone LM scores are on a different scale than the AM; non-zero values often
+# collapse the beam (empty hypotheses). Tune with EVAL_LM_WEIGHT / sweep script.
+lm_weight: 0.0
+word_score: 1.0
